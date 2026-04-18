@@ -1,5 +1,6 @@
 import dotenv from "dotenv";
 import TelegramBot from "node-telegram-bot-api";
+import http from "http";
 
 dotenv.config();
 
@@ -18,10 +19,21 @@ bot.on("message", (msg) => {
         [
           {
             text: "Играть",
-            web_app: { url: "https://rocketcrush.vercel.app" } // <-- твой URL игры
+            web_app: { url: "https://rocketcrush.vercel.app" }
           }
         ]
       ]
     }
   });
 });
+
+// Render требует, чтобы сервер слушал порт
+const PORT = process.env.PORT || 3000;
+
+http.createServer((req, res) => {
+  res.write("RocketCrush bot is running");
+  res.end();
+}).listen(PORT, () => {
+  console.log("Server running on port", PORT);
+});
+
