@@ -14,7 +14,7 @@ const { Pool } = pkg;
 // ----------------------
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // важно для Render PostgreSQL
+  ssl: { rejectUnauthorized: false },
 });
 
 // ----------------------
@@ -31,6 +31,45 @@ async function waitForDB() {
       console.log("DB not ready, retrying in 1s...");
       await new Promise((r) => setTimeout(r, 1000));
     }
+  }
+}
+
+// ----------------------
+// Автоматическое создание таблиц
+// ----------------------
+async function initTables() {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        tg_id BIGINT UNIQUE,
+        username TEXT,
+        balance INTEGER DEFAULT 1000
+      );
+    `);
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS games (
+        id SERIAL PRIMARY KEY,
+        crash_multiplier REAL,
+        started_at TIMESTAMP DEFAULT NOW(),
+        ended_at TIMESTAMP
+      );
+    `);
+
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS bets (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER REFERENCES users(id),
+        game_id INTEGER REFERENCES games(id),
+        amount INTEGER,
+        cashout_multiplier REAL
+      );
+    `);
+
+    console.log("Tables initialized");
+  } catch (e) {
+    console.error("Table init error:", e);
   }
 }
 
@@ -158,7 +197,7 @@ class CrashGame {
     this.multiplier = 1.0;
     this.interval = null;
     this.clients = new Set();
-    this.state = "idle"; // idle | running | crashed
+    this.state = "idle";
   }
 
   addClient(ws) {
@@ -238,7 +277,6 @@ async function startWebSocketServer() {
 
   console.log("WS server running on port", wsPort);
 
-  // ждём, пока БД будет готова, и только потом стартуем игру
   await waitForDB();
   game.startGame();
 
@@ -249,7 +287,6 @@ async function startWebSocketServer() {
       try {
         const data = JSON.parse(msg.toString());
 
-        // Ставка
         if (data.type === "bet") {
           const { tgId, amount } = data;
 
@@ -275,7 +312,6 @@ async function startWebSocketServer() {
           ws.send(JSON.stringify({ type: "bet_accepted", amount }));
         }
 
-        // Кэш-аут
         if (data.type === "cashout") {
           const { tgId, multiplier } = data;
 
@@ -330,4 +366,7 @@ app.listen(PORT, () => {
   console.log("HTTP backend running on port", PORT);
 });
 
-startWebSocketServer();
+(async () => {
+  await initTables();
+  startWebSocketServer();
+})();
