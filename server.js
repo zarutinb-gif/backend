@@ -1,39 +1,309 @@
+import express from "express";
+import cors from "cors";
+import bodyParser from "body-parser";
 import dotenv from "dotenv";
-import TelegramBot from "node-telegram-bot-api";
-import http from "http";
+import crypto from "crypto";
+import pkg from "pg";
+import { WebSocketServer } from "ws";
 
 dotenv.config();
+const { Pool } = pkg;
 
-console.log("TOKEN:", process.env.BOT_TOKEN);
+// ----------------------
+// PostgreSQL
+// ----------------------
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
 
-// Создаём бота
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
+// ----------------------
+// Telegram initData check
+// ----------------------
+function validateTelegramInitData(initData, botToken) {
+  const urlParams = new URLSearchParams(initData);
+  const hash = urlParams.get("hash");
+  urlParams.delete("hash");
 
-console.log("Bot is running...");
+  const dataCheckString = [...urlParams.entries()]
+    .map(([key, value]) => `${key}=${value}`)
+    .sort()
+    .join("\n");
 
-// Обработчик сообщений
-bot.on("message", (msg) => {
-  bot.sendMessage(msg.chat.id, "Запустить игру 🚀", {
-    reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: "Играть",
-            web_app: { url: "https://rocketcrush.vercel.app" }
-          }
-        ]
-      ]
+  const secretKey = crypto
+    .createHmac("sha256", "WebAppData")
+    .update(botToken)
+    .digest();
+
+  const calculatedHash = crypto
+    .createHmac("sha256", secretKey)
+    .update(dataCheckString)
+    .digest("hex");
+
+  return calculatedHash === hash;
+}
+
+// ----------------------
+// Express API
+// ----------------------
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+
+// Авторизация WebApp
+app.post("/auth/login", async (req, res) => {
+  try {
+    const { initData } = req.body;
+
+    if (!validateTelegramInitData(initData, BOT_TOKEN)) {
+      return res.status(403).json({ error: "Invalid initData" });
     }
+
+    const data = Object.fromEntries(new URLSearchParams(initData));
+    const user = JSON.parse(data.user);
+
+    const tgId = user.id;
+    const username = user.username || "unknown";
+
+    let result = await db.query(
+      "SELECT * FROM users WHERE tg_id = $1",
+      [tgId]
+    );
+
+    if (result.rows.length === 0) {
+      await db.query(
+        "INSERT INTO users (tg_id, username, balance) VALUES ($1, $2, $3)",
+        [tgId, username, 1000]
+      );
+      result = await db.query(
+        "SELECT * FROM users WHERE tg_id = $1",
+        [tgId]
+      );
+    }
+
+    res.json({
+      ok: true,
+      user: {
+        id: result.rows[0].id,
+        tgId,
+        username,
+        balance: result.rows[0].balance,
+      },
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// Получить баланс
+app.get("/user/balance", async (req, res) => {
+  try {
+    const { tgId } = req.query;
+
+    const result = await db.query(
+      "SELECT balance FROM users WHERE tg_id = $1",
+      [tgId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    res.json({ balance: result.rows[0].balance });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// История игр
+app.get("/game/history", async (req, res) => {
+  try {
+    const result = await db.query(
+      "SELECT id, crash_multiplier, started_at FROM games ORDER BY id DESC LIMIT 20"
+    );
+    res.json({ games: result.rows });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// ----------------------
+// Crash Game Logic
+// ----------------------
+class CrashGame {
+  constructor() {
+    this.currentGame = null;
+    this.multiplier = 1.0;
+    this.interval = null;
+    this.clients = new Set();
+    this.state = "idle"; // idle | running | crashed
+  }
+
+  addClient(ws) {
+    this.clients.add(ws);
+    ws.send(JSON.stringify({
+      type: "state",
+      state: this.state,
+      multiplier: this.multiplier,
+    }));
+  }
+
+  removeClient(ws) {
+    this.clients.delete(ws);
+  }
+
+  broadcast(msg) {
+    const data = JSON.stringify(msg);
+    for (const client of this.clients) {
+      if (client.readyState === 1) client.send(data);
+    }
+  }
+
+  async startGame() {
+    if (this.state === "running") return;
+
+    this.state = "running";
+    this.multiplier = 1.0;
+
+    const gameRes = await db.query(
+      "INSERT INTO games (crash_multiplier) VALUES ($1) RETURNING *",
+      [0]
+    );
+    this.currentGame = gameRes.rows[0];
+
+    this.broadcast({ type: "game_start", gameId: this.currentGame.id });
+
+    this.interval = setInterval(async () => {
+      this.multiplier += 0.05 + Math.random() * 0.1;
+
+      this.broadcast({
+        type: "tick",
+        multiplier: Number(this.multiplier.toFixed(2)),
+      });
+
+      const crashAt = 1.2 + Math.random() * 4;
+
+      if (this.multiplier >= crashAt) {
+        this.state = "crashed";
+        clearInterval(this.interval);
+
+        await db.query(
+          "UPDATE games SET crash_multiplier = $1, ended_at = NOW() WHERE id = $2",
+          [this.multiplier, this.currentGame.id]
+        );
+
+        this.broadcast({
+          type: "crash",
+          multiplier: Number(this.multiplier.toFixed(2)),
+        });
+
+        setTimeout(() => {
+          this.state = "idle";
+          this.startGame();
+        }, 3000);
+      }
+    }, 200);
+  }
+}
+
+// ----------------------
+// WebSocket Server (Node.js 24+)
+// ----------------------
+function startWebSocketServer() {
+  const wss = new WebSocketServer({ port: process.env.WS_PORT });
+  const game = new CrashGame();
+  game.startGame();
+
+  console.log("WS server running on port", process.env.WS_PORT);
+
+  wss.on("connection", (ws) => {
+    game.addClient(ws);
+
+    ws.on("message", async (msg) => {
+      try {
+        const data = JSON.parse(msg.toString());
+
+        // Ставка
+        if (data.type === "bet") {
+          const { tgId, amount } = data;
+
+          const userRes = await db.query(
+            "SELECT id, balance FROM users WHERE tg_id = $1",
+            [tgId]
+          );
+          if (userRes.rows.length === 0) return;
+
+          const user = userRes.rows[0];
+          if (user.balance < amount) return;
+
+          await db.query(
+            "UPDATE users SET balance = balance - $1 WHERE id = $2",
+            [amount, user.id]
+          );
+
+          await db.query(
+            "INSERT INTO bets (user_id, game_id, amount) VALUES ($1, $2, $3)",
+            [user.id, game.currentGame.id, amount]
+          );
+
+          ws.send(JSON.stringify({ type: "bet_accepted", amount }));
+        }
+
+        // Кэш-аут
+        if (data.type === "cashout") {
+          const { tgId, multiplier } = data;
+
+          const userRes = await db.query(
+            "SELECT id FROM users WHERE tg_id = $1",
+            [tgId]
+          );
+          if (userRes.rows.length === 0) return;
+
+          const user = userRes.rows[0];
+
+          const betRes = await db.query(
+            "SELECT * FROM bets WHERE user_id = $1 AND game_id = $2 AND cashout_multiplier IS NULL",
+            [user.id, game.currentGame.id]
+          );
+          if (betRes.rows.length === 0) return;
+
+          const bet = betRes.rows[0];
+          const winAmount = Math.floor(bet.amount * multiplier);
+
+          await db.query(
+            "UPDATE bets SET cashout_multiplier = $1 WHERE id = $2",
+            [multiplier, bet.id]
+          );
+
+          await db.query(
+            "UPDATE users SET balance = balance + $1 WHERE id = $2",
+            [winAmount, user.id]
+          );
+
+          ws.send(JSON.stringify({
+            type: "cashout_ok",
+            winAmount,
+            multiplier,
+          }));
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    });
+
+    ws.on("close", () => game.removeClient(ws));
   });
+}
+
+// ----------------------
+// Start servers
+// ----------------------
+app.listen(process.env.PORT, () => {
+  console.log("HTTP backend running on port", process.env.PORT);
 });
 
-// Render требует, чтобы сервер слушал порт
-const PORT = process.env.PORT || 3000;
-
-http.createServer((req, res) => {
-  res.write("RocketCrush bot is running");
-  res.end();
-}).listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
-
+startWebSocketServer();
