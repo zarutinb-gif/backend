@@ -14,7 +14,25 @@ const { Pool } = pkg;
 // ----------------------
 const db = new Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }, // важно для Render PostgreSQL
 });
+
+// ----------------------
+// Ожидание готовности БД
+// ----------------------
+async function waitForDB() {
+  let connected = false;
+  while (!connected) {
+    try {
+      await db.query("SELECT 1");
+      connected = true;
+      console.log("Database is ready");
+    } catch (e) {
+      console.log("DB not ready, retrying in 1s...");
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+}
 
 // ----------------------
 // Telegram initData check
@@ -170,7 +188,7 @@ class CrashGame {
     this.multiplier = 1.0;
 
     const gameRes = await db.query(
-      "INSERT INTO games (crash_multiplier) VALUES ($1) RETURNING *",
+      "INSERT INTO games (crash_multiplier, started_at) VALUES ($1, NOW()) RETURNING *",
       [0]
     );
     this.currentGame = gameRes.rows[0];
@@ -211,14 +229,18 @@ class CrashGame {
 }
 
 // ----------------------
-// WebSocket Server (Node.js 24+)
+// WebSocket Server
 // ----------------------
-function startWebSocketServer() {
-  const wss = new WebSocketServer({ port: process.env.WS_PORT });
+async function startWebSocketServer() {
+  const wsPort = process.env.WS_PORT || 4801;
+  const wss = new WebSocketServer({ port: wsPort });
   const game = new CrashGame();
-  game.startGame();
 
-  console.log("WS server running on port", process.env.WS_PORT);
+  console.log("WS server running on port", wsPort);
+
+  // ждём, пока БД будет готова, и только потом стартуем игру
+  await waitForDB();
+  game.startGame();
 
   wss.on("connection", (ws) => {
     game.addClient(ws);
@@ -302,8 +324,10 @@ function startWebSocketServer() {
 // ----------------------
 // Start servers
 // ----------------------
-app.listen(process.env.PORT, () => {
-  console.log("HTTP backend running on port", process.env.PORT);
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, () => {
+  console.log("HTTP backend running on port", PORT);
 });
 
 startWebSocketServer();
